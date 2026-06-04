@@ -1,0 +1,26 @@
+name: Daily Cache Warm-Up
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 1:00 AM UTC = 9:00 AM SGT every day
+  workflow_dispatch:        # also allows manual trigger from GitHub UI
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Render (cold start ping)
+        run: |
+          curl -sf "https://finsight-api.onrender.com/api/v1/health" || true
+
+      - name: Refresh AAPL
+        run: |
+          curl -sf -X POST "https://finsight-api.onrender.com/api/v1/report?ticker=AAPL&force_refresh=true" || true
+
+      - name: Refresh NVDA
+        run: |
+          curl -sf -X POST "https://finsight-api.onrender.com/api/v1/report?ticker=NVDA&force_refresh=true" || true
+
+      - name: Refresh TSLA
+        run: |
+          curl -sf -X POST "https://finsight-api.onrender.com/api/v1/report?ticker=TSLA&force_refresh=true" || true
