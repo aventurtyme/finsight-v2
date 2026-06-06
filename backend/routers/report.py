@@ -10,6 +10,7 @@ from db.reports import (
     list_sentiment_aggregate,
     upsert_sentiment_aggregation,
 )
+from db.recommendations import insert_recommendation
 from fetchers.stock import fetch_stock_data
 from fetchers.news import fetch_news
 from ai.gemini import generate_report
@@ -17,6 +18,27 @@ from ai.gemini import generate_report
 router = APIRouter(prefix="/api/v1", tags=["reports"])
 
 CACHE_TTL_HOURS = 6
+
+# Sector and market cap tier lookup for the 18 Phase 1 tickers.
+# Used when writing to recommendations table.
+TICKER_METADATA = {
+    "AAPL": {"sector": "Technology",             "market_cap_tier": "large"},
+    "NVDA": {"sector": "Technology",             "market_cap_tier": "large"},
+    "MSFT": {"sector": "Technology",             "market_cap_tier": "large"},
+    "AMD":  {"sector": "Technology",             "market_cap_tier": "large"},
+    "JNJ":  {"sector": "Healthcare",             "market_cap_tier": "large"},
+    "UNH":  {"sector": "Healthcare",             "market_cap_tier": "large"},
+    "PFE":  {"sector": "Healthcare",             "market_cap_tier": "large"},
+    "XOM":  {"sector": "Energy",                 "market_cap_tier": "large"},
+    "CVX":  {"sector": "Energy",                 "market_cap_tier": "large"},
+    "JPM":  {"sector": "Financials",             "market_cap_tier": "large"},
+    "GS":   {"sector": "Financials",             "market_cap_tier": "large"},
+    "AMZN": {"sector": "Consumer Discretionary", "market_cap_tier": "large"},
+    "TSLA": {"sector": "Consumer Discretionary", "market_cap_tier": "large"},
+    "NKE":  {"sector": "Consumer Discretionary", "market_cap_tier": "large"},
+    "CAT":  {"sector": "Industrials",            "market_cap_tier": "large"},
+    "BA":   {"sector": "Industrials",            "market_cap_tier": "large"},
+}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -27,6 +49,23 @@ def _is_fresh(generated_at_str: str) -> bool:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - ts < timedelta(hours=CACHE_TTL_HOURS)
+
+
+def _infer_market_cap_tier(market_cap_str: str) -> str:
+    """Infer tier from formatted market cap string e.g. '$2.50T', '$800.00B'."""
+    if not market_cap_str or market_cap_str == "N/A":
+        return "large"  # default for unknown
+    s = market_cap_str.upper()
+    if "T" in s:
+        return "large"
+    if "B" in s:
+        val = float(s.replace("$", "").replace("B", ""))
+        if val >= 10:
+            return "large"
+        elif val >= 2:
+            return "mid"
+        return "small"
+    return "small"
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -40,10 +79,15 @@ async def health():
 async def create_report(
     ticker: str = Query(..., description="Stock ticker symbol, e.g. AAPL"),
     force_refresh: bool = Query(False, description="Skip cache and regenerate"),
+    prompt_variant: str = Query("A", description="Prompt framing: A (Neutral), B (Conservative), C (Growth)"),
 ):
     ticker = ticker.upper().strip()
+    prompt_variant = prompt_variant.upper()
 
-    # 1. Cache check
+    if prompt_variant not in ("A", "B", "C"):
+        raise HTTPException(status_code=400, detail="prompt_variant must be A, B, or C.")
+
+    # 1. Cache check (reports table — v1.0 compatibility)
     if not force_refresh:
         cached = get_latest_report(ticker)
         if cached and _is_fresh(cached["generated_at"].isoformat()):
@@ -60,18 +104,26 @@ async def create_report(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"News fetch failed: {e}")
 
-    # 3. Generate AI report
+    # 3. Enrich price_data with sector/market_cap_tier for the prompt
+    meta = TICKER_METADATA.get(ticker, {})
+    price_data["sector"] = meta.get("sector", "Unknown")
+    price_data["market_cap_tier"] = meta.get(
+        "market_cap_tier",
+        _infer_market_cap_tier(price_data.get("market_cap", "N/A")),
+    )
+
+    # 4. Generate AI report
     try:
-        ai_result = generate_report(ticker, price_data, news)
+        ai_result = generate_report(ticker, price_data, news, prompt_variant=prompt_variant)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=f"AI parse error: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI generation failed: {e}")
 
-    # 4. Compute crowd sentiment rank (how many tickers rank higher)
+    # 5. Compute crowd sentiment rank
     crowd_rank = count_tickers_with_higher_sentiment(ai_result["sentiment_score"]) + 1
 
-    # 5. Assemble report
+    # 6. Assemble and persist legacy report (v1.0 reports table — keeps frontend working)
     now = datetime.now(timezone.utc).isoformat()
     report = {
         "ticker": ticker,
@@ -96,11 +148,32 @@ async def create_report(
         "news_headlines": news[:5],
         "crowd_sentiment_rank": crowd_rank,
     }
-
-    # 6. Persist report to PostgreSQL
     saved_report = insert_report(report)
 
-    # 7. Update crowd sentiment aggregation
+    # 7. Also write to recommendations table (v2.0 evaluation store)
+    try:
+        insert_recommendation({
+            "ticker": ticker,
+            "generated_at": now,
+            "prompt_variant": prompt_variant,
+            "sentiment_score": ai_result["sentiment_score"],
+            "recommendation": ai_result["recommendation"],
+            "confidence": ai_result["confidence"],
+            "bull_case": ai_result["bull_case"],
+            "bear_case": ai_result["bear_case"],
+            "key_risks": ai_result["key_risks"],
+            "overall_grade": ai_result["overall_grade"],
+            "grade_rationale": ai_result.get("grade_rationale", ""),
+            "sector": price_data["sector"],
+            "market_cap_tier": price_data["market_cap_tier"],
+            "price_at_time": price_data["current_price"],
+            "is_historical": False,
+        })
+    except Exception as e:
+        # Non-fatal — log but don't fail the response
+        print(f"[recommendations] Warning: failed to insert recommendation for {ticker}: {e}")
+
+    # 8. Update crowd sentiment aggregation
     upsert_sentiment_aggregation(ticker, ai_result["sentiment_score"])
 
     return saved_report
@@ -118,10 +191,6 @@ async def get_report(ticker: str):
 
 @router.get("/sentiment/aggregate")
 async def get_sentiment_aggregate(limit: int = Query(20, ge=1, le=100)):
-    """
-    Returns the crowd-sourced sentiment leaderboard.
-    This is Utility 2 — the aggregated output of every user query.
-    """
     result = list_sentiment_aggregate(limit)
     return {"leaderboard": result, "total": len(result)}
 
@@ -133,4 +202,4 @@ async def get_trending():
     result = list_report_tickers_since(cutoff)
     counts = Counter(r["ticker"] for r in result)
     trending = [{"ticker": t, "query_count": c} for t, c in counts.most_common(10)]
-    return {"trending": trending}
+    return {"tickers": trending}
