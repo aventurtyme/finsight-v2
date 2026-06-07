@@ -1,7 +1,7 @@
 # FinSight 2.0
 *AI Financial Intelligence Evaluation Platform*
 
-**Product Requirements Document · v2.1 · June 2026**
+**Product Requirements Document · v2.2 · June 2026**
 
 ---
 
@@ -13,10 +13,19 @@ This document is the single source of truth for FinSight 2.0. It supersedes the 
 
 - Sections are numbered 0–11 for easy reference.
 - Every new feature references the original v1.0 feature it builds on or replaces.
-- The AI assistant context block in Section 9 should be pasted at the start of any new Claude session when resuming work.
+- The AI assistant context block in Section 10 should be pasted at the start of any new Claude session when resuming work.
+
+**Changelog from v2.1:**
+- Replaced local Docker PostgreSQL with Neon cloud-hosted PostgreSQL
+- Docker removed from the project entirely
+- Historical replay year updated from 2024 to 2025
+- Historical replay automation added via GitHub Actions daily cron (one ticker per day)
+- Skip-if-exists logic added to replay script — re-runs are safe and quota-free
+- `--ticker-index` CLI flag added for workflow-driven execution
+- `.env` simplified — Docker-specific variables removed
 
 **Changelog from v2.0:**
-- Removed Supabase — replaced with local PostgreSQL
+- Removed Supabase — replaced with local PostgreSQL (now Neon)
 - Removed Alpha Vantage and NewsAPI — replaced with Finnhub for news
 - Removed Render and Vercel hosting — development and demo run locally
 - Updated ticker list and data source strategy for historical replay
@@ -95,18 +104,20 @@ Crowd Sentiment Layer → Crowd vs AI Comparison Module
 | Frontend | React + Tailwind CSS | Local (Vite dev server) | Dashboard, report viewer, evaluation dashboards | Extended |
 | Backend API | Python + FastAPI | Local (uvicorn) | REST endpoints, prompt routing | Extended |
 | AI Layer | Google Gemini gemini-2.5-flash-preview | Remote API | Multi-prompt report generation, confidence scoring | Extended |
-| Historical Replay Engine | Python script | Local (run once) | Feeds historical news + prices into Gemini; stores backdated recommendations | New |
+| Historical Replay Engine | Python script + GitHub Actions | GitHub (automated) | Feeds historical news + prices into Gemini; stores backdated recommendations | New |
 | Outcome Tracking Engine | Python script | Local (run on schedule) | Calculates 1d / 7d / 30d returns for each recommendation | New |
 | Evaluation Layer | Python (pandas, scipy) | Local via FastAPI | Computes accuracy metrics, calibration curves, sector breakdowns | New |
-| Database | PostgreSQL | Local | Stores recommendations, performance results, prompt variants | Replaced (was Supabase) |
-| Scheduler | Local cron or manual script trigger | Local | Daily outcome refresh | Simplified |
+| Database | PostgreSQL | Neon (cloud-hosted) | Stores recommendations, performance results, prompt variants | Updated (was local Docker) |
+| Scheduler | GitHub Actions cron | GitHub | Daily replay automation — one ticker per day | Updated (was local cron) |
 | Version Control | Git + GitHub | GitHub | Source code, public repo | Unchanged |
 
-**Note on deployment:** The project runs locally for development. A clean deployment to Railway (backend) and Vercel (frontend) will be done once before applications open in January 2027. This avoids free-tier IP-blocking issues with financial data APIs during development.
+**Note on deployment:** The project runs locally for development. A clean deployment to Railway (backend) and Vercel (frontend) will be done once before applications open in January 2027.
+
+**Note on database:** Neon is used instead of local Docker PostgreSQL. Neon's free tier provides 0.5 GB storage, no inactivity pausing, and handles GitHub Actions connection patterns cleanly.
 
 ### 3.3 API Stack
 
-Streamlined to three APIs only. All previous APIs (Alpha Vantage, NewsAPI) are removed.
+Streamlined to three APIs only.
 
 | API | Purpose | Endpoint(s) Used |
 |---|---|---|
@@ -114,13 +125,15 @@ Streamlined to three APIs only. All previous APIs (Alpha Vantage, NewsAPI) are r
 | **Finnhub** | News headlines (live + historical) | `/company-news` |
 | **Google Gemini** | AI report generation (3 prompt variants) | `gemini-2.5-flash-preview` |
 
-**Twelve Data free tier:** 800 credits/day. Each call costs 1 credit. The historical replay script must be rate-limited and run across multiple days if needed.
+**Twelve Data free tier:** 800 credits/day, 8 req/min. The replay script uses a 9-second delay between calls to stay within the rate limit. One ticker = 13 TD calls (1 quote + 12 time_series).
 
-**Finnhub free tier:** `/company-news` endpoint is available on the free tier and supports date-range queries per ticker, giving access to historical headlines going back approximately 2 years. This covers the Jan–Dec 2024 replay window.
+**Finnhub free tier:** `/company-news` supports date-range queries per ticker with historical headlines going back approximately 2 years, covering the Jan–Dec 2025 replay window.
+
+**Gemini free tier:** 20 requests/day. One ticker = 12 Gemini calls. The GitHub Actions workflow processes one ticker per day to stay within this limit.
 
 ### 3.4 Database Schema
 
-Local PostgreSQL. The v1.0 `reports` and `sentiment_aggregation` tables are retained. Three new tables are added for v2.0.
+Neon PostgreSQL. The v1.0 `reports` and `sentiment_aggregation` tables are retained. Three new tables are added for v2.0.
 
 **recommendations** (replaces/extends v1.0 reports for evaluation purposes):
 ```sql
@@ -168,7 +181,7 @@ created_at            TIMESTAMPTZ
 
 ### 4.1 Target Tickers
 
-18 tickers across 6 sectors. Chosen for news coverage depth, sector diversity, and analytical contrast value.
+16 tickers across 6 sectors. Chosen for news coverage depth, sector diversity, and analytical contrast value.
 
 | Sector | Tickers | Notes |
 |---|---|---|
@@ -181,13 +194,32 @@ created_at            TIMESTAMPTZ
 
 ### 4.2 Replay Scope
 
-- **Date range:** January 2024 – December 2024
+- **Date range:** January 2025 – December 2025
 - **Frequency:** One recommendation per ticker per month (monthly sampling)
-- **Total data points:** 18 tickers × 12 months = 216 recommendations (baseline, Variant A only)
-- **With all 3 prompt variants:** 216 × 3 = 648 recommendations total (Phase 3)
+- **Total data points:** 16 tickers × 12 months = 192 recommendations (baseline, Variant A only)
+- **With all 3 prompt variants:** 192 × 3 = 576 recommendations total (Phase 3)
 - **Outcome data:** Real Twelve Data historical prices — ground truth is actual market data, not fabricated
 
-### 4.3 News Data Approach
+### 4.3 Replay Automation
+
+The replay is automated via GitHub Actions. The workflow runs daily at 02:00 UTC, processing one ticker per day. It auto-advances through the ticker list using day-of-year mod 16. The full 16-ticker dataset completes in 16 days.
+
+The script checks the database before each row — if the recommendation already exists, it is skipped without any API calls. This makes re-runs safe and prevents wasting Gemini quota.
+
+Ticker index order (stable — used by `--ticker-index` flag and GitHub Actions):
+
+| Index | Ticker | Index | Ticker |
+|---|---|---|---|
+| 0 | AAPL | 8 | CVX |
+| 1 | NVDA | 9 | JPM |
+| 2 | MSFT | 10 | GS |
+| 3 | AMD | 11 | AMZN |
+| 4 | JNJ | 12 | TSLA |
+| 5 | UNH | 13 | NKE |
+| 6 | PFE | 14 | CAT |
+| 7 | XOM | 15 | BA |
+
+### 4.4 News Data Approach
 
 Finnhub `/company-news` is the sole news source for both historical replay and live generation. For dates where Finnhub returns sparse results (fewer than 3 headlines), the prompt is still sent to Gemini with available data and a note that news coverage was limited. This is recorded in the recommendation metadata and factored into the findings narrative as a data quality observation.
 
@@ -199,16 +231,17 @@ Finnhub `/company-news` is the sole news source for both historical replay and l
 
 **Feature 1: Historical Replay Engine**
 
-Purpose: Seed the recommendation database with 200+ backdated data points without waiting months for real-time accumulation.
+Purpose: Seed the recommendation database with 190+ backdated data points without waiting months for real-time accumulation.
 
 How it works:
-- For each ticker and target month in Jan–Dec 2024, fetch headlines from Finnhub `/company-news` for that month.
+- For each ticker and target month in Jan–Dec 2025, fetch headlines from Finnhub `/company-news` for that month.
 - Fetch the closing price on the first trading day of that month from Twelve Data `/time_series`.
 - Feed the historical news + price data into Gemini using Variant A (Neutral) prompt.
 - Store the recommendation with `generated_at` set to the historical date and `is_historical = TRUE`.
 - Outcome tracking then fetches actual subsequent returns using Twelve Data historical prices.
+- Automated via GitHub Actions — one ticker per day.
 
-Target output: 216 historical recommendations (18 tickers × 12 months) across 6 sectors before launching the evaluation dashboard.
+Target output: 192 historical recommendations (16 tickers × 12 months) across 6 sectors before launching the evaluation dashboard.
 
 ---
 
@@ -225,8 +258,6 @@ Calculated fields per recommendation:
 | return_30d | % price change 30 trading days after recommendation date | Twelve Data `/time_series` |
 | spy_return_30d | SPY ETF % change over same 30-day window (benchmark) | Twelve Data `/time_series` |
 
-A local script (replaceable with GitHub Actions cron post-deployment) runs daily to evaluate any recommendations that have reached their 1d / 7d / 30d windows.
-
 ---
 
 **Feature 3: Confidence Calibration Dashboard**
@@ -237,8 +268,6 @@ Dashboard displays:
 - Confidence band vs. success rate table (bands: 90–100%, 70–90%, 50–70%, <50%).
 - Success rate defined as: recommendation direction matched actual 30-day return direction.
 - Visual calibration curve: ideal calibration line vs. actual observed accuracy.
-
-This is the most differentiated analytical feature in the platform. A well-calibrated model should show higher success rates in higher confidence bands. If it does not, that finding is equally interesting and defensible.
 
 ---
 
@@ -262,8 +291,6 @@ Three prompt variants tested on the same ticker inputs:
 | A — Neutral | Balanced, objective assessment. No bias toward optimism or caution. | Baseline |
 | B — Conservative | Emphasise downside risks, capital preservation, margin of safety. | Expected to produce more Hold/Reduce |
 | C — Growth-Oriented | Focus on growth catalysts, upside potential, momentum. | Expected to produce more Buy; test for optimistic bias |
-
-Evaluation metric: success rate per variant at 30-day horizon. Secondary: confidence score distribution per variant.
 
 ---
 
@@ -289,7 +316,7 @@ Framing: demonstrate the methodology, not conclusive results. Sample size does n
 ### 6.1 Base URL (Local Development)
 
 ```
-http://localhost:8000/api/v2
+http://localhost:8000/api/v1
 ```
 
 ### 6.2 Endpoints
@@ -346,8 +373,6 @@ JSON schema:
 | C — Growth-Oriented | Focus on growth catalysts, upside potential, and momentum. Weight positive signals and forward-looking indicators more heavily. |
 
 ### 7.4 User Prompt Template
-
-Price data from Twelve Data `/quote` and `/statistics`. News from Finnhub `/company-news`. Alpha Vantage and RSI/MACD fields removed — no longer available without additional API calls.
 
 ```
 Analyze the following company and return a JSON report.
@@ -413,13 +438,11 @@ Target completion: mid-July 2026. Applications open: January 2027 intake.
 
 | Phase | Dates | Focus | Key Deliverables |
 |---|---|---|---|
-| Phase 1 | Early June | Foundation + Data | Set up local Postgres schema. Rewrite fetchers (Twelve Data + Finnhub only). Update Gemini prompt for confidence + recommendation fields. Build Historical Replay Engine. Seed 216 historical recommendations. Verify outcome data quality. |
+| Phase 1 | Early June | Foundation + Data | Set up Neon PostgreSQL. Run schema. Update fetchers (Twelve Data + Finnhub only). Update Gemini prompt for confidence + recommendation fields. Build Historical Replay Engine. Automate via GitHub Actions. Seed 192 historical recommendations. Verify outcome data quality. |
 | Phase 2 | Mid–Late June | Evaluation Core | Build Outcome Tracking Engine. Build Confidence Calibration Dashboard. Build Crowd vs AI Comparison module. Wire up evaluation API endpoints. |
 | Phase 3 | Early July | Prompt Sensitivity + Sectors | Run historical replay for Variants B and C. Build Sector Accuracy Dashboard. Build Prompt Sensitivity Dashboard. |
 | Phase 4 | Mid July | Polish + Narrative | Write /findings narrative based on actual data. Add statistical analysis (Tier 3). Polish UI. Update resume bullets. Prep interview talking points. |
 | Buffer | Late July | Deployment + Review | Single clean deployment to Railway + Vercel. Final QA. Ensure demo runs cleanly. GitHub repo public and documented. |
-
-**Critical path note:** Phase 1 must start in early June. The 30-day outcome window means recommendations generated in early June will have 30-day results by mid-July. Starting late compresses the evaluation window.
 
 ---
 
@@ -431,7 +454,7 @@ Paste the following block at the start of any new Claude session when resuming w
 --- PROJECT CONTEXT (paste at start of session) ---
 
 Project: FinSight 2.0 — AI Financial Intelligence Evaluation Platform
-Version: 2.1 (infrastructure update, June 2026)
+Version: 2.2 (infrastructure update, June 2026)
 Target completion: Mid-July 2026 | Applications: Jan 2027 internship intake
 
 Core concept: Evaluate WHEN AI-generated financial analysis can be trusted.
@@ -440,32 +463,40 @@ Not a financial analysis tool — an AI evaluation platform using financial mark
 Stack:
 Backend: Python + FastAPI (local uvicorn)
 Frontend: React + Tailwind + Recharts (local Vite)
-Database: PostgreSQL (local)
+Database: PostgreSQL on Neon (cloud-hosted, free tier)
 AI: Google Gemini gemini-2.5-flash-preview (3 prompt variants: Neutral / Conservative / Growth)
 Data: Twelve Data API (prices + fundamentals) + Finnhub (news only)
-Scheduler: Local script (cron post-deployment)
+Replay automation: GitHub Actions daily cron — one ticker per day
 Repo: https://github.com/aventurtyme/sc4052-project.git
 
-APIs used (3 total, streamlined from v1.0):
+Docker: NOT used. Removed in v2.2.
+
+APIs used (3 total):
 - Twelve Data: /quote, /time_series, /statistics
 - Finnhub: /company-news
 - Google Gemini: gemini-2.5-flash-preview
 
-Removed from v1.0: Alpha Vantage, NewsAPI, Supabase, Render, Vercel
+Removed from v1.0: Alpha Vantage, NewsAPI, Supabase, Render, Vercel (dev), Docker
 
-Ticker list (18 tickers, 6 sectors):
-- Technology: AAPL, NVDA, MSFT, AMD
-- Healthcare: JNJ, UNH, PFE
-- Energy: XOM, CVX
-- Financials: JPM, GS
-- Consumer Discretionary: AMZN, TSLA, NKE
-- Industrials: CAT, BA
+Ticker list (16 tickers, 6 sectors), stable index order:
+0=AAPL, 1=NVDA, 2=MSFT, 3=AMD (Technology)
+4=JNJ, 5=UNH, 6=PFE (Healthcare)
+7=XOM, 8=CVX (Energy)
+9=JPM, 10=GS (Financials)
+11=AMZN, 12=TSLA, 13=NKE (Consumer Discretionary)
+14=CAT, 15=BA (Industrials)
 
-Historical replay scope: Jan 2024 – Dec 2024, monthly per ticker, Variant A first
-Target data points: 216 (Phase 1), 648 with all 3 variants (Phase 3)
+Historical replay scope: Jan 2025 – Dec 2025, monthly per ticker, Variant A first
+Target data points: 192 (Phase 1), 576 with all 3 variants (Phase 3)
+
+Replay automation: .github/workflows/historical_replay.yml
+- Runs daily at 02:00 UTC
+- One ticker per day (stays within Gemini 20 RPD free tier)
+- Auto-advances via day-of-year mod 16
+- Skip-if-exists logic prevents re-processing
 
 New in v2.0:
-1. Historical Replay Engine (seed 216 backdated recommendations)
+1. Historical Replay Engine (seed 192 backdated recommendations)
 2. Outcome Tracking Engine (1d / 7d / 30d returns vs SPY benchmark)
 3. Confidence Calibration Dashboard
 4. Crowd vs AI vs Market Comparison
@@ -486,7 +517,7 @@ Current milestone: [INSERT CURRENT PHASE/TASK HERE]
 
 ### 11.1 Recommended Resume Bullet
 
-Built an AI financial intelligence evaluation platform (FinSight 2.0) that generated 200+ structured investment recommendations via Google Gemini, tracked historical market outcomes, and measured AI accuracy across confidence bands, sectors, and prompt framings — identifying conditions under which AI analysis is and is not reliable.
+Built an AI financial intelligence evaluation platform (FinSight 2.0) that generated 190+ structured investment recommendations via Google Gemini, tracked historical market outcomes, and measured AI accuracy across confidence bands, sectors, and prompt framings — identifying conditions under which AI analysis is and is not reliable.
 
 ### 11.2 Key Interview Talking Points
 
@@ -495,7 +526,7 @@ Built an AI financial intelligence evaluation platform (FinSight 2.0) that gener
 - **On confidence calibration:** "We found that AI confidence scores were reasonably predictive above 80% but essentially uninformative below 70% — which has direct implications for how you'd deploy this in a real workflow." *(Adjust with actual findings.)*
 - **On prompt sensitivity:** "Running the same ticker through three different prompt framings showed meaningful variance in recommendations — which tells you the output is sensitive to how you ask the question, not just what the data says."
 - **On crowd vs AI:** "The crowd sentiment layer outperformed AI on [sector] but underperformed on [sector] — which suggests hybrid signals could be more robust than either alone." *(Adjust with actual findings.)*
-- **On limitations:** "With ~200 data points, I can't claim statistical significance — but I can demonstrate the methodology. The framework scales with data, and the findings narrative is honest about sample size constraints."
+- **On limitations:** "With ~190 data points, I can't claim statistical significance — but I can demonstrate the methodology. The framework scales with data, and the findings narrative is honest about sample size constraints."
 
 ### 11.3 Portfolio Differentiation
 
@@ -519,9 +550,9 @@ FinSight 2.0 fills the evaluation and measurement competency gap — a distinct 
 | Options Sentiment (put/call ratio) | Domain complexity without analytical payoff for target roles |
 | Voice Interface | UI feature; no analytical signal |
 | Mobile App (React Native) | Engineering complexity; no differentiation for analyst/consulting roles |
-| Docker | Unnecessary complexity for a solo local project |
+| Docker | Removed in v2.2 — unnecessary complexity for a cloud-DB project |
 | Technical indicators (RSI, MACD, EMA) | Required additional API calls; removed with Alpha Vantage |
 
 ---
 
-*FinSight 2.0 PRD • v2.1 • June 2026 • For internal development use*
+*FinSight 2.0 PRD • v2.2 • June 2026 • For internal development use*
