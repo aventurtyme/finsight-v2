@@ -1,7 +1,7 @@
 """
 Historical Replay Engine — FinSight 2.0 Phase 1
 ================================================
-Generates backdated AI recommendations for 18 tickers across Jan–Dec 2024.
+Generates backdated AI recommendations for 18 tickers across Jan–Dec 2025.
 For each ticker + month:
   1. Fetch that month's news from Finnhub
   2. Fetch the closing price on the first trading day of that month from Twelve Data
@@ -18,9 +18,14 @@ Usage:
     # Single ticker test:
     python scripts/historical_replay.py --tickers AAPL NVDA
 
-Rate limiting: 1 second between Gemini calls to stay within free tier.
-Twelve Data: each month needs 1 /time_series call (1 credit). 18 tickers = 18 credits/run.
-Finnhub: no strict rate limit on company-news but we add a small delay to be safe.
+    # Process one ticker by index (0-based) — used by GitHub Actions:
+    python scripts/historical_replay.py --ticker-index 0
+
+Rate limiting:
+  Gemini:      20 RPD free tier. 1 ticker = 12 calls. Run 1 ticker/day to stay safe.
+  Twelve Data: ~8 req/min, 800 credits/day. TD_DELAY_SECONDS controls pacing.
+               1 ticker = 13 TD calls (1 quote + 12 time_series). Fine per day.
+  Finnhub:     No hard rate limit stated; FINNHUB_DELAY_SECONDS adds courtesy sleep.
 """
 
 import argparse
@@ -38,6 +43,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from ai.gemini import generate_report
+from db.postgres import fetch_one
 from db.recommendations import insert_recommendation
 from fetchers.news import fetch_news
 
@@ -47,7 +53,17 @@ TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 REPLAY_MONTHS = [
-    date(2024, m, 1) for m in range(1, 13)  # Jan 2024 – Dec 2024
+    date(2025, m, 1) for m in range(1, 13)  # Jan 2025 – Dec 2025
+]
+
+# Ordered list — index is stable so --ticker-index works reliably.
+TICKER_ORDER = [
+    "AAPL", "NVDA", "MSFT", "AMD",
+    "JNJ",  "UNH",  "PFE",
+    "XOM",  "CVX",
+    "JPM",  "GS",
+    "AMZN", "TSLA", "NKE",
+    "CAT",  "BA",
 ]
 
 TICKERS = {
@@ -69,20 +85,41 @@ TICKERS = {
     "BA":   {"sector": "Industrials",            "market_cap_tier": "large"},
 }
 
-GEMINI_DELAY_SECONDS = 1.5   # between Gemini calls
-FINNHUB_DELAY_SECONDS = 0.3  # between Finnhub calls
-# Twelve Data free tier = 8 requests/minute = 7.5s minimum between calls.
-# We use 8s to be safe.
-TD_DELAY_SECONDS = 8.0
+# Delay between API calls — tune if you hit rate limits
+GEMINI_DELAY_SECONDS = 2.0    # between Gemini calls (conservative for RPD)
+FINNHUB_DELAY_SECONDS = 0.5   # between Finnhub calls
+# Twelve Data free tier: 8 req/min → minimum 7.5s between calls.
+# We use 9s to be safe.
+TD_DELAY_SECONDS = 9.0
+
+
+# ── Skip-if-exists check ───────────────────────────────────────────────────
+
+def _already_exists(ticker: str, month_start: date) -> bool:
+    """
+    Returns True if a historical Variant-A recommendation already exists
+    for this ticker + month. Prevents re-processing on re-runs.
+    """
+    row = fetch_one(
+        """
+        SELECT id FROM recommendations
+        WHERE ticker = %s
+          AND DATE_TRUNC('month', generated_at AT TIME ZONE 'UTC')
+              = DATE_TRUNC('month', %s::timestamptz AT TIME ZONE 'UTC')
+          AND prompt_variant = 'A'
+          AND is_historical = TRUE
+        """,
+        (ticker, f"{month_start.isoformat()}T00:00:00+00:00"),
+    )
+    return row is not None
 
 
 # ── Twelve Data helpers ────────────────────────────────────────────────────
 
 def fetch_ticker_meta(ticker: str) -> dict:
     """
-    Fetch company name and current 52w high/low from /quote.
-    Called ONCE per ticker before the monthly loop — not every month.
-    Returns a meta dict; falls back to defaults on failure.
+    Fetch company name and 52w high/low from /quote.
+    Called ONCE per ticker before the monthly loop.
     """
     meta = {
         "company_name": ticker,
@@ -109,8 +146,6 @@ def fetch_ticker_meta(ticker: str) -> dict:
 def fetch_first_trading_day_price(ticker: str, month_start: date, ticker_meta: dict) -> dict | None:
     """
     Fetch the closing price on the first trading day of the month.
-    Uses ticker_meta (fetched once per ticker) for company name and 52w range.
-    Returns a price_data dict or None on failure.
     """
     end_date = month_start + timedelta(days=10)
 
@@ -185,7 +220,7 @@ def run_replay(tickers: list[str], dry_run: bool = False):
         meta = TICKERS[ticker]
         print(f"\n── {ticker} ({meta['sector']}) ──────────────────────────")
 
-        # Fetch company name + 52w range once per ticker (saves 12 API calls per ticker)
+        # Fetch company name + 52w range once per ticker
         if not dry_run:
             ticker_meta = fetch_ticker_meta(ticker)
             print(f"  Meta: {ticker_meta['company_name']} | 52w {ticker_meta['week_52_low']}–{ticker_meta['week_52_high']}")
@@ -198,6 +233,12 @@ def run_replay(tickers: list[str], dry_run: bool = False):
             month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
 
             print(f"  {label} ...", end=" ", flush=True)
+
+            # ── Skip if already in DB (safe to re-run) ──────────────
+            if not dry_run and _already_exists(ticker, month_start):
+                print("SKIP (already exists)")
+                skipped += 1
+                continue
 
             # 1. Fetch price data (1 TD call per month)
             if not dry_run:
@@ -265,7 +306,6 @@ def run_replay(tickers: list[str], dry_run: bool = False):
                 }
 
             # 4. Build the recommendation record
-            # generated_at is set to the actual first trading day of the month
             generated_at = f"{price_data['trading_date']}T09:30:00+00:00"
 
             rec = {
@@ -303,7 +343,7 @@ def run_replay(tickers: list[str], dry_run: bool = False):
     print(f"\n{'=' * 60}")
     print(f"Replay complete.")
     print(f"  Done:    {done}")
-    print(f"  Skipped: {skipped}  (no price data)")
+    print(f"  Skipped: {skipped}  (already exists or no price data)")
     print(f"  Failed:  {failed}  (API or DB error)")
     print(f"{'=' * 60}\n")
 
@@ -321,11 +361,36 @@ if __name__ == "__main__":
         "--tickers",
         nargs="+",
         metavar="TICKER",
-        help="Only replay these tickers (e.g. --tickers AAPL NVDA). Default: all 16.",
+        help="Process these specific tickers (e.g. --tickers AAPL NVDA). Default: all.",
+    )
+    parser.add_argument(
+        "--ticker-index",
+        type=int,
+        metavar="N",
+        help=(
+            "Process a single ticker by its 0-based position in TICKER_ORDER. "
+            "Used by GitHub Actions to advance one ticker per day. "
+            f"Valid range: 0–{len(TICKER_ORDER) - 1}. "
+            f"Order: {', '.join(f'{i}={t}' for i, t in enumerate(TICKER_ORDER))}"
+        ),
     )
     args = parser.parse_args()
 
-    selected = [t.upper() for t in args.tickers] if args.tickers else list(TICKERS.keys())
+    # Resolve which tickers to process
+    if args.ticker_index is not None:
+        if args.tickers:
+            print("Error: --ticker-index and --tickers are mutually exclusive.")
+            sys.exit(1)
+        if not (0 <= args.ticker_index < len(TICKER_ORDER)):
+            print(f"Error: --ticker-index must be 0–{len(TICKER_ORDER) - 1}.")
+            sys.exit(1)
+        selected = [TICKER_ORDER[args.ticker_index]]
+        print(f"Ticker index {args.ticker_index} → {selected[0]}")
+    elif args.tickers:
+        selected = [t.upper() for t in args.tickers]
+    else:
+        selected = list(TICKER_ORDER)
+
     unknown = [t for t in selected if t not in TICKERS]
     if unknown:
         print(f"Unknown tickers: {unknown}. Must be one of: {list(TICKERS.keys())}")
