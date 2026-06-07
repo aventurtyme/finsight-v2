@@ -33,7 +33,7 @@ Later phases extend this into dashboard views for confidence calibration, prompt
 | Frontend | React + Tailwind CSS + Recharts | Local Vite dev server |
 | Backend API | Python + FastAPI | Local uvicorn |
 | Database | PostgreSQL | Neon (cloud-hosted) |
-| AI | Google Gemini `gemini-2.5-flash-preview` | Remote API |
+| AI | Google Gemini `gemini-3.5-flash` | Remote API |
 | Price and fundamentals data | Twelve Data | Remote API |
 | News data | Finnhub `/company-news` | Remote API |
 | Replay automation | GitHub Actions (daily cron) | GitHub |

@@ -123,7 +123,7 @@ Streamlined to three APIs only.
 |---|---|---|
 | **Twelve Data** | Live + historical price data, fundamentals | `/quote`, `/time_series`, `/statistics` |
 | **Finnhub** | News headlines (live + historical) | `/company-news` |
-| **Google Gemini** | AI report generation (3 prompt variants) | `gemini-2.5-flash-preview` |
+| **Google Gemini** | AI report generation (3 prompt variants) | `gemini-3.5-flash` |
 
 **Twelve Data free tier:** 800 credits/day, 8 req/min. The replay script uses a 9-second delay between calls to stay within the rate limit. One ticker = 13 TD calls (1 quote + 12 time_series).
 
