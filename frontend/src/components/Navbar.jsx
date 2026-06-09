@@ -2,13 +2,13 @@ import { Link, useLocation } from 'react-router-dom';
 
 export default function Navbar() {
   const { pathname } = useLocation();
-  
+
   const link = (to, label) => (
     <Link
       to={to}
       className={`text-[13px] font-sans transition-colors ${
-        pathname === to 
-          ? 'text-[var(--fg-primary)] font-medium' 
+        pathname === to || pathname.startsWith(to + '/')
+          ? 'text-[var(--fg-primary)] font-medium'
           : 'text-[var(--fg-secondary)] hover:text-[var(--fg-primary)]'
       }`}
     >
@@ -22,13 +22,14 @@ export default function Navbar() {
         <Link to="/" className="font-serif text-lg text-[var(--fg-primary)] flex items-center gap-2">
           FinSight
         </Link>
-        
+
         <nav className="flex items-center gap-8">
+          {link('/evaluation', 'Evaluation')}
           {link('/sentiment', 'Sentiment')}
           {link('/about', 'About')}
-          
+
           <a
-            href="https://github.com/aventurtyme/sc4052-project"
+            href="https://github.com/aventurtyme/finsight-v2"
             target="_blank"
             rel="noreferrer"
             className="text-[13px] font-sans text-[var(--fg-secondary)] hover:text-[var(--fg-primary)] transition-colors"

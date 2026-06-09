@@ -11,7 +11,7 @@ export default function Home() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    getTrending().then(d => setTrending(d.tickers || [])).catch(() => {});
+    getTrending().then(d => setTrending((d.tickers || []).map(t => t.ticker))).catch(() => {});
   }, []);
 
   const go = (t) => {
