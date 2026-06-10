@@ -8,6 +8,8 @@ import EvaluationHub           from './pages/EvaluationHub';
 import EvaluationAccuracy      from './pages/EvaluationAccuracy';
 import EvaluationCalibration   from './pages/EvaluationCalibration';
 import EvaluationSectors       from './pages/EvaluationSectors';
+import EvaluationCrowdVsAI     from './pages/EvaluationCrowdVsAI';
+import EvaluationPrompts       from './pages/EvaluationPrompts';
 
 export default function App() {
   return (
@@ -22,6 +24,8 @@ export default function App() {
         <Route path="/evaluation/accuracy"       element={<EvaluationAccuracy />} />
         <Route path="/evaluation/calibration"    element={<EvaluationCalibration />} />
         <Route path="/evaluation/sectors"        element={<EvaluationSectors />} />
+        <Route path="/evaluation/crowd-vs-ai"    element={<EvaluationCrowdVsAI />} />
+        <Route path="/evaluation/prompts"        element={<EvaluationPrompts />} />
       </Routes>
     </BrowserRouter>
   );
