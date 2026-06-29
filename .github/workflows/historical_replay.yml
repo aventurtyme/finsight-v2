@@ -1,13 +1,21 @@
 name: Historical Replay — Daily Batch
 
 # Runs once a day at 02:00 UTC (10:00 SGT).
-# Processes ONE ticker per run to stay within Gemini's 20 RPD free-tier limit.
-# TICKER_INDEX advances through the 16-ticker list over 16 days.
-# After all tickers are done the workflow still runs but the script exits cleanly
-# (every row already exists → all skipped).
+# Processes ONE ticker + ONE prompt variant per run to stay within Gemini's
+# 20 RPD free-tier limit.
+#
+# The 16-ticker x 3-variant (A/B/C) grid is cycled through using
+# day-of-year mod 48:
+#   combo 0–15  → Variant A, tickers 0–15  (already fully seeded — all SKIP)
+#   combo 16–31 → Variant B, tickers 0–15
+#   combo 32–47 → Variant C, tickers 0–15
+#
+# Skip-if-exists logic means already-completed ticker/month/variant rows are
+# never reprocessed, so re-running or restarting the cycle is always safe and
+# costs zero extra API calls for rows already done.
 #
 # Manual trigger: Actions → "Historical Replay — Daily Batch" → Run workflow
-# You can override the ticker index or run a dry-run from the UI.
+# You can override the ticker index, variant, or run a dry-run from the UI.
 
 on:
   schedule:
@@ -18,6 +26,10 @@ on:
         description: "0-based ticker index (0=AAPL … 15=BA). Leave blank to use auto-advance."
         required: false
         default: ""
+      variant:
+        description: "Prompt variant override: A, B, or C. Leave blank to use auto-advance."
+        required: false
+        default: ""
       dry_run:
         description: "Dry run — no Gemini calls, no DB writes (true/false)"
         required: false
@@ -26,7 +38,7 @@ on:
 jobs:
   replay:
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # 1 ticker × 12 months × ~(9s TD + 2s Gemini) ≈ 18 min
+    timeout-minutes: 45   # 1 ticker × 12 months × ~(9s TD + 2s Gemini, plus retries) ≈ 20 min
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────
@@ -44,23 +56,36 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r backend/requirements.txt
 
-      # ── 3. Resolve ticker index ───────────────────────────────────
-      # Auto-advance: day-of-year mod 16 cycles through all tickers.
-      # If a manual override is provided via workflow_dispatch, use that instead.
-      - name: Resolve ticker index
+      # ── 3. Resolve ticker index and variant ───────────────────────
+      # Auto-advance: day-of-year mod 48 cycles through all 16 tickers x 3
+      # variants. Manual overrides via workflow_dispatch take precedence
+      # for whichever value is supplied.
+      - name: Resolve ticker index and variant
         id: resolve_index
         run: |
+          DOY=$(date +%j)
+          COMBO=$(( (DOY - 1) % 48 ))
+
           if [ -n "${{ github.event.inputs.ticker_index }}" ]; then
             INDEX="${{ github.event.inputs.ticker_index }}"
-            echo "Source: manual override"
+            echo "Ticker index source: manual override"
           else
-            # Day of year (1-based) mod 16 = 0..15
-            DOY=$(date +%j)
-            INDEX=$(( (DOY - 1) % 16 ))
-            echo "Source: auto-advance (day of year $DOY → index $INDEX)"
+            INDEX=$(( COMBO % 16 ))
+            echo "Ticker index source: auto-advance"
           fi
+
+          if [ -n "${{ github.event.inputs.variant }}" ]; then
+            VARIANT="${{ github.event.inputs.variant }}"
+            echo "Variant source: manual override"
+          else
+            VARIANTS=(A B C)
+            VARIANT="${VARIANTS[$(( COMBO / 16 ))]}"
+            echo "Variant source: auto-advance"
+          fi
+
           echo "index=$INDEX" >> "$GITHUB_OUTPUT"
-          echo "Ticker index: $INDEX"
+          echo "variant=$VARIANT" >> "$GITHUB_OUTPUT"
+          echo "Day of year: $DOY  →  combo: $COMBO  →  ticker index: $INDEX, variant: $VARIANT"
 
       # ── 4. Run replay script ──────────────────────────────────────
       - name: Run historical replay
@@ -80,4 +105,5 @@ jobs:
 
           python scripts/historical_replay.py \
             --ticker-index ${{ steps.resolve_index.outputs.index }} \
+            --variant ${{ steps.resolve_index.outputs.variant }} \
             $DRY_RUN_FLAG

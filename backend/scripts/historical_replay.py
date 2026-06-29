@@ -1,31 +1,39 @@
 """
-Historical Replay Engine — FinSight 2.0 Phase 1
-================================================
-Generates backdated AI recommendations for 18 tickers across Jan–Dec 2025.
+Historical Replay Engine — FinSight 2.0 Phase 1-3
+==================================================
+Generates backdated AI recommendations for 16 tickers across Jan–Dec 2025.
 For each ticker + month:
   1. Fetch that month's news from Finnhub
   2. Fetch the closing price on the first trading day of that month from Twelve Data
-  3. Send to Gemini (Variant A — Neutral)
+  3. Send to Gemini using the requested prompt variant (A, B, or C)
   4. Insert into recommendations table with is_historical=True
 
 Usage:
     cd backend
-    python scripts/historical_replay.py
+    python scripts/historical_replay.py                       # all tickers, Variant A
+    python scripts/historical_replay.py --variant B           # all tickers, Variant B
 
     # Dry run (no DB writes, no Gemini calls) — just checks data availability:
     python scripts/historical_replay.py --dry-run
 
     # Single ticker test:
-    python scripts/historical_replay.py --tickers AAPL NVDA
+    python scripts/historical_replay.py --tickers AAPL NVDA --variant C
 
     # Process one ticker by index (0-based) — used by GitHub Actions:
-    python scripts/historical_replay.py --ticker-index 0
+    python scripts/historical_replay.py --ticker-index 0 --variant B
 
 Rate limiting:
   Gemini:      20 RPD free tier. 1 ticker = 12 calls. Run 1 ticker/day to stay safe.
   Twelve Data: ~8 req/min, 800 credits/day. TD_DELAY_SECONDS controls pacing.
                1 ticker = 13 TD calls (1 quote + 12 time_series). Fine per day.
   Finnhub:     No hard rate limit stated; FINNHUB_DELAY_SECONDS adds courtesy sleep.
+
+Retry behavior:
+  Transient Gemini errors (503 UNAVAILABLE / high demand) are retried automatically
+  inside ai/gemini.py before this script ever sees them as a failure. Genuine daily
+  quota exhaustion is NOT retried and will surface here as a FAIL for that row —
+  it will be picked up again next time this ticker/variant/month combo is processed,
+  since the skip-if-exists check means already-succeeded rows are never re-attempted.
 """
 
 import argparse
@@ -55,6 +63,9 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 REPLAY_MONTHS = [
     date(2025, m, 1) for m in range(1, 13)  # Jan 2025 – Dec 2025
 ]
+
+# Valid prompt variants — must match ai/gemini.py FRAMING_INSTRUCTIONS keys.
+PROMPT_VARIANTS = ("A", "B", "C")
 
 # Ordered list — index is stable so --ticker-index works reliably.
 TICKER_ORDER = [
@@ -95,10 +106,10 @@ TD_DELAY_SECONDS = 9.0
 
 # ── Skip-if-exists check ───────────────────────────────────────────────────
 
-def _already_exists(ticker: str, month_start: date) -> bool:
+def _already_exists(ticker: str, month_start: date, variant: str) -> bool:
     """
-    Returns True if a historical Variant-A recommendation already exists
-    for this ticker + month. Prevents re-processing on re-runs.
+    Returns True if a historical recommendation already exists for this
+    ticker + month + prompt variant. Prevents re-processing on re-runs.
     """
     row = fetch_one(
         """
@@ -106,10 +117,10 @@ def _already_exists(ticker: str, month_start: date) -> bool:
         WHERE ticker = %s
           AND DATE_TRUNC('month', generated_at AT TIME ZONE 'UTC')
               = DATE_TRUNC('month', %s::timestamptz AT TIME ZONE 'UTC')
-          AND prompt_variant = 'A'
+          AND prompt_variant = %s
           AND is_historical = TRUE
         """,
-        (ticker, f"{month_start.isoformat()}T00:00:00+00:00"),
+        (ticker, f"{month_start.isoformat()}T00:00:00+00:00", variant),
     )
     return row is not None
 
@@ -204,7 +215,11 @@ def _safe_float(value) -> float | None:
 
 # ── Main replay loop ───────────────────────────────────────────────────────
 
-def run_replay(tickers: list[str], dry_run: bool = False):
+def run_replay(tickers: list[str], variant: str = "A", dry_run: bool = False):
+    variant = variant.upper()
+    if variant not in PROMPT_VARIANTS:
+        raise ValueError(f"Invalid variant '{variant}'. Must be one of {PROMPT_VARIANTS}.")
+
     total = len(tickers) * len(REPLAY_MONTHS)
     done = 0
     skipped = 0
@@ -213,12 +228,13 @@ def run_replay(tickers: list[str], dry_run: bool = False):
     print(f"\n{'=' * 60}")
     print(f"FinSight Historical Replay Engine")
     print(f"Tickers: {len(tickers)}  |  Months: {len(REPLAY_MONTHS)}  |  Target: {total}")
+    print(f"Prompt variant: {variant}")
     print(f"Dry run: {dry_run}")
     print(f"{'=' * 60}\n")
 
     for ticker in tickers:
         meta = TICKERS[ticker]
-        print(f"\n── {ticker} ({meta['sector']}) ──────────────────────────")
+        print(f"\n── {ticker} ({meta['sector']}) — Variant {variant} ──────────────────")
 
         # Fetch company name + 52w range once per ticker
         if not dry_run:
@@ -234,8 +250,8 @@ def run_replay(tickers: list[str], dry_run: bool = False):
 
             print(f"  {label} ...", end=" ", flush=True)
 
-            # ── Skip if already in DB (safe to re-run) ──────────────
-            if not dry_run and _already_exists(ticker, month_start):
+            # ── Skip if already in DB for this variant (safe to re-run) ─
+            if not dry_run and _already_exists(ticker, month_start, variant):
                 print("SKIP (already exists)")
                 skipped += 1
                 continue
@@ -281,11 +297,11 @@ def run_replay(tickers: list[str], dry_run: bool = False):
 
             news_count = len(news)
 
-            # 3. Call Gemini
+            # 3. Call Gemini (transient-error retries happen inside ai/gemini.py)
             if not dry_run:
                 try:
                     ai_result = generate_report(
-                        ticker, price_data, news, prompt_variant="A"
+                        ticker, price_data, news, prompt_variant=variant
                     )
                     time.sleep(GEMINI_DELAY_SECONDS)
                 except Exception as e:
@@ -302,7 +318,7 @@ def run_replay(tickers: list[str], dry_run: bool = False):
                     "key_risks": ["dry run"],
                     "overall_grade": "B",
                     "grade_rationale": "dry run",
-                    "prompt_variant": "A",
+                    "prompt_variant": variant,
                 }
 
             # 4. Build the recommendation record
@@ -311,7 +327,7 @@ def run_replay(tickers: list[str], dry_run: bool = False):
             rec = {
                 "ticker": ticker,
                 "generated_at": generated_at,
-                "prompt_variant": "A",
+                "prompt_variant": variant,
                 "sentiment_score": ai_result["sentiment_score"],
                 "recommendation": ai_result["recommendation"],
                 "confidence": ai_result["confidence"],
@@ -341,7 +357,7 @@ def run_replay(tickers: list[str], dry_run: bool = False):
             print(f"OK  [{rec_label} | conf={conf_label} | news={news_count}]")
 
     print(f"\n{'=' * 60}")
-    print(f"Replay complete.")
+    print(f"Replay complete. Variant: {variant}")
     print(f"  Done:    {done}")
     print(f"  Skipped: {skipped}  (already exists or no price data)")
     print(f"  Failed:  {failed}  (API or DB error)")
@@ -374,6 +390,15 @@ if __name__ == "__main__":
             f"Order: {', '.join(f'{i}={t}' for i, t in enumerate(TICKER_ORDER))}"
         ),
     )
+    parser.add_argument(
+        "--variant",
+        choices=PROMPT_VARIANTS,
+        default="A",
+        help=(
+            "Prompt framing to generate: A (Neutral), B (Conservative), C (Growth). "
+            "Default: A."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve which tickers to process
@@ -396,4 +421,4 @@ if __name__ == "__main__":
         print(f"Unknown tickers: {unknown}. Must be one of: {list(TICKERS.keys())}")
         sys.exit(1)
 
-    run_replay(tickers=selected, dry_run=args.dry_run)
+    run_replay(tickers=selected, variant=args.variant, dry_run=args.dry_run)

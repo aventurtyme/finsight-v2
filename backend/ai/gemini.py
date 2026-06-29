@@ -1,5 +1,8 @@
 import os
 import json
+import random
+import time
+
 from google import genai
 from dotenv import load_dotenv
 from ai.prompt import build_prompt
@@ -35,6 +38,55 @@ JSON schema:
 
 {framing_instruction}"""
 
+# ── Retry config for transient Gemini errors (503 overloaded, etc.) ─────────
+# These do NOT apply to genuine daily-quota exhaustion — that's a separate,
+# non-retryable condition. See _is_quota_exhausted below.
+MAX_RETRIES = 2
+RETRY_BASE_DELAY = 5  # seconds, doubles each attempt + jitter
+
+
+def _is_quota_exhausted(err) -> bool:
+    """
+    True only for genuine daily-quota exhaustion (RESOURCE_EXHAUSTED + "day"/"daily"
+    in the message). Retrying this is pointless since the quota won't reset until
+    tomorrow and every retry would just consume another nonexistent call.
+
+    Per-minute rate limits and 503 UNAVAILABLE ("high demand") are transient and
+    fall through to the retry path instead.
+    """
+    msg = str(err).lower()
+    return "resource_exhausted" in msg and ("per day" in msg or "daily" in msg)
+
+
+def _call_gemini_with_retry(model_id: str, user_prompt: str, system_prompt: str):
+    """
+    Calls Gemini with retry-with-backoff for transient errors (503 overloaded,
+    momentary network issues, etc.). Does not retry genuine quota exhaustion.
+    """
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(
+                model=model_id,
+                contents=user_prompt,
+                config={"system_instruction": system_prompt},
+            )
+        except Exception as e:
+            last_err = e
+            if _is_quota_exhausted(e):
+                # Don't burn more calls on a quota that's already gone.
+                raise
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                print(
+                    f"    [Gemini] transient error, retrying in {delay:.1f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES}): {e}"
+                )
+                time.sleep(delay)
+            else:
+                raise
+    raise last_err  # pragma: no cover — unreachable, satisfies linters
+
 
 def generate_report(
     ticker: str,
@@ -57,11 +109,7 @@ def generate_report(
     model_id = "gemini-3.5-flash"
     user_prompt = build_prompt(ticker, price_data, news)
 
-    response = client.models.generate_content(
-        model=model_id,
-        contents=user_prompt,
-        config={"system_instruction": system_prompt},
-    )
+    response = _call_gemini_with_retry(model_id, user_prompt, system_prompt)
 
     raw_text = response.text.strip()
 
